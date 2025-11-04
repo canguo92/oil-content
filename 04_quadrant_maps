@@ -1,0 +1,257 @@
+#!/usr/bin/env Rscript
+# ------------------------------------------------------------------------------
+# 04_quadrant_maps.R
+# 县级四象限可视化（E列 gb 精确匹配；锁定 13 省；Nature 风格）
+# 输出：每年三张图 A/B/Full + 多年合成面板（仅保留一个图例）
+# ------------------------------------------------------------------------------
+suppressPackageStartupMessages({
+  pkgs <- c("sf","dplyr","readr","stringr","stringi","ggplot2","scales","optparse","cowplot")
+  to_install <- pkgs[!pkgs %in% installed.packages()[,1]]
+  if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+  library(sf); library(dplyr); library(readr); library(stringr); library(stringi)
+  library(ggplot2); library(scales); library(optparse); library(cowplot)
+})
+
+# ---------------- CLI ----------------
+option_list <- list(
+  make_option("--csv",       type="character", help="CROSS_county.csv 路径（含 grow_year, gb, quadrant 或 A_flag_top/B_flag_top）"),
+  make_option("--cnty_geo",  type="character", help="中国_县.geojson 路径"),
+  make_option("--prov_geo",  type="character", help="中国_省.geojson 路径"),
+  make_option("--outdir",    type="character", default="outputs_quadrants/fig_maps", help="输出目录（默认 outputs_quadrants/fig_maps）"),
+  make_option("--years",     type="character", default="2012,2016,2019,2021,2023", help='年份（逗号分隔），或 "all"'),
+  make_option("--whitelist", type="character", default="安徽,重庆,广西,贵州,河南,湖北,湖南,江西,江苏,陕西,四川,云南,浙江", 
+              help="13省白名单（逗号分隔，省名），默认与文稿一致"),
+  make_option("--font",      type="character", default="Arial", help="地图字体（默认 Arial）"),
+  make_option("--png_dpi",   type="integer",   default=600, help="PNG 分辨率（默认 600）"),
+  make_option("--tif_dpi",   type="integer",   default=500, help="TIFF 分辨率（默认 500）")
+)
+args <- parse_args(OptionParser(option_list = option_list))
+stopifnot(!is.null(args$csv), file.exists(args$csv))
+stopifnot(!is.null(args$cnty_geo), file.exists(args$cnty_geo))
+stopifnot(!is.null(args$prov_geo), file.exists(args$prov_geo))
+
+OUTDIR <- normalizePath(args$outdir, winslash = "/", mustWork = FALSE)
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+YEARS <- if (tolower(args$years) == "all") NA_integer_ else as.integer(strsplit(args$years, ",")[[1]])
+WHITELIST <- strsplit(args$whitelist, ",")[[1]] |> trimws()
+BASE_FONT <- args$font
+PNG_DPI   <- args$png_dpi
+TIF_DPI   <- args$tif_dpi
+
+# ---------------- 工具 ----------------
+gb_clean <- function(x) gsub("\\D", "", as.character(x))
+gb_to_prov <- function(gb){
+  s <- gb_clean(gb)
+  ifelse(substr(s,1,3)=="156" & nchar(s)>=5, substr(s,4,5),
+         ifelse(nchar(s)>=2, substr(s,1,2), NA_character_))
+}
+quad_from_any <- function(qtxt, A_flag=NULL, B_flag=NULL){
+  x <- as.character(qtxt)
+  x <- stringi::stri_trans_general(x, "Fullwidth-Halfwidth")
+  x <- stringr::str_to_lower(x)
+  x <- stringr::str_replace_all(x, "\\s+", "")
+  out <- dplyr::case_when(
+    stringr::str_detect(x, "q1") ~ "Q1",
+    stringr::str_detect(x, "q2") ~ "Q2",
+    stringr::str_detect(x, "q3") ~ "Q3",
+    stringr::str_detect(x, "q4") ~ "Q4",
+    TRUE ~ NA_character_
+  )
+  need <- is.na(out)
+  if (any(need) && !is.null(A_flag) && !is.null(B_flag)) {
+    a <- as.integer(A_flag[need] %in% c(1, TRUE, "1"))
+    b <- as.integer(B_flag[need] %in% c(1, TRUE, "1"))
+    out[need] <- dplyr::case_when(
+      a==1 & b==1 ~ "Q1",
+      a==1 & b==0 ~ "Q2",
+      a==0 & b==1 ~ "Q3",
+      a==0 & b==0 ~ "Q4",
+      TRUE ~ NA_character_
+    )
+  }
+  factor(out, levels = c("Q1","Q2","Q3","Q4"))
+}
+
+prov_code_map <- c(
+  "北京"="11","天津"="12","河北"="13","山西"="14","内蒙古"="15",
+  "辽宁"="21","吉林"="22","黑龙江"="23","上海"="31","江苏"="32",
+  "浙江"="33","安徽"="34","福建"="35","江西"="36","山东"="37",
+  "河南"="41","湖北"="42","湖南"="43","广东"="44","广西"="45",
+  "海南"="46","重庆"="50","四川"="51","贵州"="52","云南"="53",
+  "西藏"="54","陕西"="61","甘肃"="62","青海"="63","宁夏"="64","新疆"="65"
+)
+
+# 白名单到省代码
+WHITE_CODES <- unname(prov_code_map[intersect(WHITELIST, names(prov_code_map))])
+
+# ---------------- 读数据 ----------------
+dat_all <- readr::read_csv(args$csv, locale = locale(encoding = "GBK"), show_col_types = FALSE)
+stopifnot(all(c("grow_year","gb") %in% names(dat_all)))
+dat_all <- dat_all %>% mutate(
+  gb_clean = gb_clean(gb),
+  A_ft     = if ("A_flag_top" %in% names(.)) .$A_flag_top else NULL,
+  B_ft     = if ("B_flag_top" %in% names(.)) .$B_flag_top else NULL,
+  Q        = if ("quadrant" %in% names(.)) quad_from_any(.$quadrant, A_ft, B_ft) else quad_from_any(NA, A_ft, B_ft)
+)
+if (!all(levels(dat_all$Q) == c("Q1","Q2","Q3","Q4"))) dat_all$Q <- factor(dat_all$Q, levels=c("Q1","Q2","Q3","Q4"))
+if (!any(is.na(YEARS))) dat_all <- dat_all %>% filter(grow_year %in% YEARS)
+
+# ---------------- 读矢量 ----------------
+cn_cnty <- suppressWarnings(sf::st_read(args$cnty_geo, quiet = TRUE))
+cn_prov <- suppressWarnings(sf::st_read(args$prov_geo, quiet = TRUE))
+stopifnot(all(c("name","gb") %in% names(cn_cnty)))
+stopifnot(all(c("name","gb") %in% names(cn_prov)))
+
+if (is.na(sf::st_crs(cn_cnty))) sf::st_crs(cn_cnty) <- 4490 else cn_cnty <- sf::st_transform(cn_cnty, 4490)
+if (is.na(sf::st_crs(cn_prov))) sf::st_crs(cn_prov) <- 4490 else cn_prov <- sf::st_transform(cn_prov, 4490)
+sf::sf_use_s2(FALSE)
+cn_cnty <- if ("st_make_valid" %in% getNamespaceExports("sf")) sf::st_make_valid(cn_cnty) else sf::st_buffer(cn_cnty, 0)
+cn_prov <- if ("st_make_valid" %in% getNamespaceExports("sf")) sf::st_make_valid(cn_prov) else sf::st_buffer(cn_prov, 0)
+
+cn_cnty <- cn_cnty %>% mutate(gb_clean = gb_clean(gb), prov_code = gb_to_prov(gb))
+cn_prov <- cn_prov %>% mutate(gb_clean = gb_clean(gb), prov_code = gb_to_prov(gb))
+
+cn_cnty_13 <- dplyr::filter(cn_cnty, prov_code %in% WHITE_CODES)
+cn_prov_13 <- dplyr::filter(cn_prov, prov_code %in% WHITE_CODES)
+
+bb13 <- sf::st_bbox(cn_cnty_13); buf <- 0.5
+X_LIM <- c(bb13$xmin - buf, bb13$xmax + buf)
+Y_LIM <- c(bb13$ymin - buf, bb13$ymax + buf)
+
+# ---------------- 视觉样式 ----------------
+theme_nature_map <- function(base_size = 11){
+  theme_minimal(base_size = base_size, base_family = BASE_FONT) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text  = element_blank(),
+      axis.title = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      legend.title = element_text(face = "bold"),
+      legend.key.height = unit(0.45, "cm"),
+      legend.key.width  = unit(0.9,  "cm"),
+      plot.margin = margin(4, 6, 4, 6)
+    )
+}
+quad_pal <- c(
+  Q1 = "#D7191C",   # Observed & Climate-driven
+  Q2 = "#FF7F0E",   # Observed-only
+  Q3 = "#1F77B4",   # Climate-driven-only
+  Q4 = "#9E9E9E"    # non-hotspot（更深灰避免撞色）
+)
+quad_labels <- c("Q1"="Observed & Climate-driven","Q2"="Observed-only","Q3"="Climate-driven-only","Q4"="non-hotspot")
+legend_guide <- guide_legend(nrow = 2, byrow = TRUE, keyheight = unit(4.5,"mm"), keywidth = unit(7,"mm"))
+
+stroke_bg   <- 0.25
+stroke_hits <- 0.22
+fill_bg_A   <- "grey96"
+fill_bg_B   <- "grey97"
+line_bg     <- "grey85"
+
+# ---------------- 单年三图 ----------------
+make_maps_for_year <- function(YEAR){
+  dat_year <- dat_all %>% filter(grow_year == YEAR) %>% select(gb_clean, Q)
+  m    <- cn_cnty_13 %>% left_join(dat_year, by = "gb_clean")
+  hits <- dplyr::filter(m, !is.na(Q))
+
+  # auto-zoom
+  if (nrow(hits) > 0) {
+    bb  <- sf::st_bbox(hits); buf2 <- 1.0
+    xlim <- c(max(X_LIM[1],  bb$xmin - buf2), min(X_LIM[2], bb$xmax + buf2))
+    ylim <- c(max(Y_LIM[1],  bb$ymin - buf2), min(Y_LIM[2], bb$ymax + buf2))
+  } else { xlim <- X_LIM; ylim <- Y_LIM }
+
+  # A 清爽
+  p_A <- ggplot() +
+    geom_sf(data = sf::st_union(sf::st_geometry(cn_cnty_13)),
+            fill = fill_bg_A, color = line_bg, linewidth = stroke_bg) +
+    geom_sf(data = cn_prov_13, fill = NA, color = "black", linewidth = stroke_bg)
+  if (nrow(hits) > 0) {
+    p_A <- p_A + geom_sf(data = hits, aes(fill = Q), color = "black", linewidth = stroke_hits) +
+      scale_fill_manual(values = quad_pal, breaks = names(quad_labels), labels = quad_labels, drop = FALSE, guide = legend_guide)
+  } else p_A <- p_A + guides(fill = "none")
+  p_A <- p_A + coord_sf(xlim = X_LIM, ylim = Y_LIM, expand = FALSE) + theme_nature_map() + ggtitle(as.character(YEAR))
+
+  # B 放大
+  p_B <- ggplot() +
+    geom_sf(data = sf::st_union(sf::st_geometry(cn_cnty_13)),
+            fill = fill_bg_B, color = line_bg, linewidth = stroke_bg) +
+    geom_sf(data = cn_prov_13, fill = NA, color = "black", linewidth = stroke_bg)
+  if (nrow(hits) > 0) {
+    p_B <- p_B + geom_sf(data = hits, aes(fill = Q), color = "black", linewidth = stroke_hits) +
+      scale_fill_manual(values = quad_pal, breaks = names(quad_labels), labels = quad_labels, drop = FALSE, guide = legend_guide)
+  } else p_B <- p_B + guides(fill = "none")
+  p_B <- p_B + coord_sf(xlim = xlim, ylim = ylim, expand = TRUE) + theme_nature_map() + ggtitle(as.character(YEAR))
+
+  # Full（含 No data）
+  m$Q_show <- as.character(m$Q); m$Q_show[is.na(m$Q_show)] <- "No data"
+  m$Q_show <- factor(m$Q_show, levels = c("Q1","Q2","Q3","Q4","No data"))
+  quad_pal_full    <- c(quad_pal, "No data" = "#F5F5F5")
+  quad_labels_full <- c(quad_labels, "No data" = "No data")
+
+  p_full <- ggplot() +
+    geom_sf(data = m, aes(fill = Q_show), color = "black", linewidth = 0.12) +
+    geom_sf(data = cn_prov_13, fill = NA, color = "black", linewidth = stroke_bg, inherit.aes = FALSE) +
+    scale_fill_manual(values = quad_pal_full, breaks = c("Q1","Q2","Q3","Q4","No data"),
+                      labels = quad_labels_full, drop = FALSE, guide = legend_guide) +
+    coord_sf(xlim = X_LIM, ylim = Y_LIM, expand = FALSE) + theme_nature_map() + ggtitle(as.character(YEAR))
+
+  # 写盘（PNG: Cairo；TIFF: ragg 优先）
+  fn_A <- file.path(OUTDIR, sprintf("map_%d_quadrants_A_outline_13prov.png", YEAR))
+  fn_B <- file.path(OUTDIR, sprintf("map_%d_quadrants_B_focus_13prov.png", YEAR))
+  fn_F <- file.path(OUTDIR, sprintf("map_%d_quadrants_full_13prov.png", YEAR))
+  ggsave(fn_A, p_A, width = 9.5, height = 6.8, dpi = PNG_DPI, type = if (capabilities("cairo")) "cairo" else NULL)
+  ggsave(fn_B, p_B, width = 9.5, height = 6.8, dpi = PNG_DPI, type = if (capabilities("cairo")) "cairo" else NULL)
+  ggsave(fn_F, p_full, width = 9.5, height = 6.8, dpi = PNG_DPI, type = if (capabilities("cairo")) "cairo" else NULL)
+
+  message(sprintf("[%d] 输出: %s | %s | %s", YEAR, fn_A, fn_B, fn_F))
+  list(A=p_A, B=p_B, Full=p_full)
+}
+
+# ---------------- 批量年份 ----------------
+years_plot <- sort(unique(dat_all$grow_year))
+if (!any(is.na(YEARS))) years_plot <- YEARS
+
+plots_for_panel <- list()
+for (yr in years_plot) {
+  out <- make_maps_for_year(yr)
+  plots_for_panel[[as.character(yr)]] <- out$A + guides(fill="none")
+}
+
+# ---------------- 多面板合成（A Outline，仅一个图例） ----------------
+legend_seed <- ggplot(
+  data.frame(Q = factor(c("Q1","Q2","Q3","Q4"), levels = c("Q1","Q2","Q3","Q4")))
+) +
+  geom_bar(aes(x = Q, y = 1, fill = Q), stat = "identity") +
+  scale_fill_manual(name="Legend", values = quad_pal, breaks = names(quad_labels), labels = quad_labels, drop = FALSE) +
+  theme_minimal(base_size = 11, base_family = BASE_FONT) +
+  theme(legend.position="right", legend.title=element_text(face="bold"),
+        legend.key.height = unit(0.45, "cm"), legend.key.width = unit(0.9, "cm"),
+        axis.text=element_blank(), axis.title=element_blank(), panel.grid=element_blank(), plot.margin=margin(0,0,0,0))
+leg <- cowplot::get_legend(legend_seed)
+
+lab_letters <- letters[seq_along(years_plot)]
+row_plt <- cowplot::plot_grid(
+  plotlist = lapply(seq_along(years_plot), function(i) {
+    (plots_for_panel[[as.character(years_plot[i])]]) +
+      ggtitle(as.character(years_plot[i]))
+  }),
+  nrow = 1,
+  labels = lab_letters,
+  label_size = 14, label_fontface = "bold", label_fontfamily = BASE_FONT,
+  label_x = 0.02, label_y = 0.98, hjust = 0, vjust = 1
+)
+combined <- cowplot::plot_grid(row_plt, leg, ncol = 2, rel_widths = c(1, 0.17))
+
+fn_panel_png <- file.path(OUTDIR, "panel_A_outline_13prov_years.png")
+ggsave(fn_panel_png, combined, width = 18, height = 4.6, dpi = 400, type = if (capabilities("cairo")) "cairo" else NULL)
+
+fn_panel_tif <- file.path(OUTDIR, "panel_A_outline_13prov_years_500dpi.tiff")
+if (requireNamespace("ragg", quietly = TRUE)) {
+  ggsave(fn_panel_tif, combined, width = 18, height = 4.6, dpi = TIF_DPI,
+         device = ragg::agg_tiff, compression = "lzw")
+} else {
+  ggsave(fn_panel_tif, combined, width = 18, height = 4.6, dpi = TIF_DPI,
+         device = "tiff", compression = "lzw")
+}
+message("合成导出：", fn_panel_png, " | ", fn_panel_tif)
