@@ -1,0 +1,491 @@
+#!/usr/bin/env Rscript
+# ------------------------------------------------------------------------------
+# 01_attribution_pipeline.R
+# Climatic attribution for rapeseed oil content with XGBoost + SHAP (LOYO)
+#
+# Usage (examples):
+#   Rscript scripts/01_attribution_pipeline.R \
+#     --input data/rapeseed_oilcontent.csv \
+#     --outdir outputs \
+#     --target "Oil content" \
+#     --feature_range "10:108" \
+#     --focus_years "2012,2016,2019,2021,2023" \
+#     --seed 1
+#
+# Repo layout (suggested):
+#   data/                        # your input .csv lives here
+#   outputs/                     # figures + tables will be written here
+#     figs/
+#     tables/
+#   scripts/01_attribution_pipeline.R
+#
+# Notes:
+# - Uses relative paths; no Windows-only absolute paths.
+# - All figures (.png/.tiff) -> outputs/figs, tables (.csv) -> outputs/tables
+# - Keeps your B_outputs filenames for continuity (now written under outputs/tables)
+# ------------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  pkgs <- c("readr","dplyr","tidyr","stringr","purrr","ggplot2","xgboost",
+            "Matrix","cowplot","scales","rlang","boot","Kendall","trend","optparse")
+  to_install <- pkgs[!pkgs %in% installed.packages()[,1]]
+  if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+  library(readr);  library(dplyr);  library(tidyr);   library(stringr); library(purrr)
+  library(ggplot2);library(xgboost);library(Matrix);  library(cowplot);  library(scales)
+  library(rlang);  library(boot);   library(Kendall); library(trend);   library(optparse)
+})
+
+# ----------------------- CLI options -----------------------
+option_list <- list(
+  make_option("--input",        type="character", help="Input CSV path (UTF-8/GB18030/GBK tolerated)."),
+  make_option("--outdir",       type="character", default="outputs", help="Output root (default: outputs)"),
+  make_option("--target",       type="character", default="Oil content", help='Target column, default: "Oil content"'),
+  make_option("--feature_range",type="character", default="10:108", help='Feature column index range like "10:108"'),
+  make_option("--focus_years",  type="character", default="2012,2016,2019,2021,2023", help="Comma list of years to compute SHAP"),
+  make_option("--seed",         type="integer",   default=1, help="Random seed (default: 1)")
+)
+args <- parse_args(OptionParser(option_list = option_list))
+stopifnot(!is.null(args$input), file.exists(args$input))
+
+OUT_ROOT <- normalizePath(args$outdir, winslash = "/", mustWork = FALSE)
+FIG_ROOT <- file.path(OUT_ROOT, "figs")
+TAB_ROOT <- file.path(OUT_ROOT, "tables")
+dir.create(FIG_ROOT, showWarnings = FALSE, recursive = TRUE)
+dir.create(TAB_ROOT, showWarnings = FALSE, recursive = TRUE)
+
+target_raw_col <- args$target
+feature_idx    <- {
+  # parse "a:b"
+  sp <- strsplit(args$feature_range, ":", fixed = TRUE)[[1]]
+  as.integer(seq(as.integer(sp[1]), as.integer(sp[2])))
+}
+focus_years    <- as.integer(strsplit(args$focus_years, ",")[[1]])
+set.seed(args$seed)
+
+# ----------------------- Helpers -----------------------
+robust_read_csv <- function(path){
+  for (enc in c("UTF-8","UTF-8-BOM","GB18030","GBK","latin1")){
+    x <- try(readr::read_csv(path, locale=readr::locale(encoding=enc), show_col_types=FALSE), silent=TRUE)
+    if(!inherits(x,"try-error")) return(x)
+  }
+  stop("Failed to read file. Please check path or encoding: ", path)
+}
+
+save_figure_pub <- function(p, filename_base, width=7.0, height=4.2, dpi=600){
+  png_path  <- file.path(FIG_ROOT, paste0(filename_base, ".png"))
+  tiff_path <- file.path(FIG_ROOT, paste0(filename_base, ".tiff"))
+  suppressWarnings(unlink(c(png_path, tiff_path), force=TRUE))
+  ggplot2::ggsave(filename = png_path, plot = p, width = width, height = height, dpi = 300)
+  grDevices::tiff(filename = tiff_path, width = width, height = height, units = "in", res = dpi, compression = "lzw")
+  print(p); grDevices::dev.off()
+}
+
+write_csv_new <- function(x, file_base, ...) {
+  out <- file.path(TAB_ROOT, file_base)
+  dir.create(dirname(out), showWarnings = FALSE, recursive = TRUE)
+  readr::write_csv(x, out, ...)
+}
+
+nature_theme_light <- function(base_size = 11, base_family = "Arial"){
+  theme_classic(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      legend.position   = "right",
+      axis.title.x      = element_text(size = base_size + 1, margin = margin(6,0,0,0)),
+      axis.title.y      = element_text(size = base_size + 1, angle = 90,
+                                       vjust = 0.5, hjust = 0.5, margin = margin(0,2,0,0)),
+      axis.ticks        = element_line(linewidth = 0.3),
+      axis.line         = element_line(linewidth = 0.5),
+      panel.grid.major  = element_line(color = "grey92", linewidth = 0.3),
+      panel.grid.minor  = element_blank()
+    )
+}
+
+# ----------------------- Read & basic prep -----------------------
+raw <- robust_read_csv(args$input)
+names(raw) <- trimws(names(raw))
+feature_cols <- names(raw)[feature_idx]
+
+# Region fallback
+if (!"Region" %in% names(raw)) raw$Region <- raw$Province
+raw <- raw %>%
+  mutate(
+    Region = trimws(Region),
+    Region3 = dplyr::case_when(
+      grepl("^\\s*Upper\\s+Yangtze",  Region, ignore.case = TRUE) ~ "Upper Yangtze",
+      grepl("^\\s*Middle\\s+Yangtze", Region, ignore.case = TRUE) ~ "Middle Yangtze",
+      grepl("^\\s*Lower\\s+Yangtze",  Region, ignore.case = TRUE) ~ "Lower Yangtze",
+      Region %in% c("上游","中游","下游") ~ dplyr::recode(Region, "上游"="Upper Yangtze",
+                                                           "中游"="Middle Yangtze","下游"="Lower Yangtze"),
+      TRUE ~ NA_character_
+    )
+  )
+
+# ----------------------- Target build: county-year mean -> detrend -> year de-mean -----------------------
+cy_mean <- raw %>%
+  group_by(Province, City, County, grow_year) %>%
+  summarise(y_val = mean(.data[[target_raw_col]], na.rm=TRUE), .groups="drop")
+
+fit_trend_1series <- function(d){
+  d <- arrange(d, grow_year)
+  ok <- is.finite(d$y_val) & is.finite(d$grow_year)
+  out <- d; out$trend <- NA_real_; out$resid <- NA_real_
+  n_ok <- sum(ok); nyrs <- dplyr::n_distinct(d$grow_year[ok])
+  if (n_ok == 0) { out$method <- "no_data"; out$nyrs <- 0; return(out) }
+  if (n_ok == 1) {
+    mu <- d$y_val[ok]; out$trend[ok] <- mu; out$resid[ok] <- d$y_val[ok] - mu
+    out$method <- "mean_only_1pt"; out$nyrs <- 1; return(out)
+  }
+  zt <- as.numeric(scale(d$grow_year[ok], center=TRUE, scale=TRUE))
+  y  <- d$y_val[ok]
+  span <- max(0.55, min(0.90, 5/nyrs + 0.35))
+  pr <- try({
+    suppressWarnings(predict(loess(y ~ zt, span=span, degree=1, family="symmetric",
+                                   control=loess.control(surface="direct", trace.hat="approx"))))
+  }, silent=TRUE)
+  method <- "loess"
+  if (inherits(pr, "try-error") || any(!is.finite(pr)) || nyrs < 5) {
+    pr <- as.numeric(predict(lm(y ~ zt))); method <- "linear"
+  }
+  out$trend[ok] <- pr; out$resid[ok] <- y - pr; out$method <- method; out$nyrs <- nyrs
+  out
+}
+
+cy_detr <- cy_mean %>%
+  group_by(Province, City, County) %>%
+  group_modify(~fit_trend_1series(.x)) %>% ungroup()
+
+year_eq <- cy_detr %>%
+  group_by(grow_year) %>%
+  summarise(mu_year_eq = mean(resid, na.rm=TRUE), .groups="drop")
+
+target <- cy_detr %>%
+  left_join(year_eq, by="grow_year") %>%
+  transmute(grow_year, Province, City, County, y = resid - mu_year_eq)
+
+# ----------------------- Features: county-year means -----------------------
+feat_cy <- raw %>%
+  group_by(Province, City, County, grow_year) %>%
+  summarise(across(all_of(feature_cols), ~mean(suppressWarnings(as.numeric(.x)), na.rm=TRUE)), .groups="drop")
+
+dat   <- target %>% inner_join(feat_cy, by=c("Province","City","County","grow_year"))
+years <- sort(unique(dat$grow_year))
+
+# ----------------------- Fold builder (LOYO) -----------------------
+mk_fold_mats <- function(test_year){
+  train <- dat %>% filter(grow_year != test_year)
+  test  <- dat %>% filter(grow_year == test_year)
+  base_train <- train %>%
+    group_by(Province, City, County) %>%
+    summarise(across(all_of(feature_cols), ~mean(.x, na.rm=TRUE)), .groups="drop")
+  train2 <- train %>% left_join(base_train, by=c("Province","City","County"), suffix = c("", "_base"))
+  test2  <- test  %>% left_join(base_train, by=c("Province","City","County"), suffix = c("", "_base"))
+  for (fc in feature_cols){
+    base_col <- paste0(fc, "_base")
+    glob_base <- mean(train2[[fc]], na.rm=TRUE)
+    test2[[base_col]][is.na(test2[[base_col]])]  <- glob_base
+    train2[[base_col]][is.na(train2[[base_col]])]<- glob_base
+    train2[[fc]] <- train2[[fc]] - train2[[base_col]]
+    test2[[fc]]  <- test2[[fc]]  - test2[[base_col]]
+  }
+  sds <- sapply(feature_cols, function(fc) sd(train2[[fc]], na.rm=TRUE))
+  sds[sds==0 | !is.finite(sds)] <- 1
+  for (fc in feature_cols){
+    train2[[fc]] <- train2[[fc]] / sds[fc]
+    test2[[fc]]  <- test2[[fc]]  / sds[fc]
+    med <- median(train2[[fc]], na.rm=TRUE); if (!is.finite(med)) med <- 0
+    train2[[fc]][!is.finite(train2[[fc]])] <- med
+    test2[[fc]][!is.finite(test2[[fc]])]  <- med
+  }
+  list(train=train2, test=test2)
+}
+
+# ----------------------- Train per-year + SHAP (focus years) -----------------------
+grp_pal <- c(
+  "Thermal (heat)" = "#E41A1C",
+  "Cold stress"    = "#377EB8",
+  "Moisture"       = "#4DAF4A",
+  "Radiation"      = "#984EA3",
+  "Wind"           = "#FF7F00",
+  "Humidity"       = "#A65628"
+)
+
+assign_feature_group_no_others <- function(features){
+  f_low <- tolower(features)
+  group <- rep(NA_character_, length(features))
+  cold_pat <- "(^|[_])tnn($|_)|(^|[_])fdd($|_)|(^|[_])fd($|_)|cold|frost|chill|freeze|freezing|low\\s*temp|cold\\s*spell"
+  group[grepl(cold_pat, f_low, perl=TRUE)] <- "Cold stress"
+  heat_pat <- "gdd|edd|(^|[_])txx($|_)|etr|temp|tmean|tmax|meant|maxt|mint|hot|warm|growing\\.degree|gsl|dtr|accum"
+  group[is.na(group) & grepl(heat_pat, f_low, perl=TRUE)] <- "Thermal (heat)"
+  moist_pat <- "precip|\\brx1day\\b|\\brx5day\\b|\\br10\\b|\\br20\\b|r95|sdii|\\bcdd\\b|\\bcwd\\b|\\bevap\\b|evapo|et0|pet|aet|eta|\\bvpd\\b|soil.*moist|\\bsm(\\b|_)|swc|theta|snow"
+  group[is.na(group) & grepl(moist_pat, f_low, perl=TRUE)] <- "Moisture"
+  rad_pat <- "solarrad|\\bsrad\\b|\\brad\\b|shortwave|rsds|sunshine|\\bsun\\b|insol|\\bpar\\b|cloud"
+  group[is.na(group) & grepl(rad_pat, f_low, perl=TRUE)] <- "Radiation"
+  hum_pat <- "humidity|\\brh\\b|relative.*humidity|vapor\\s*press|\\bvp\\b"
+  group[is.na(group) & grepl(hum_pat, f_low, perl=TRUE)] <- "Humidity"
+  wind_pat <- "\\bwind\\b|wind(_|\\s)?speed|\\bws\\b|\\bu10\\b|\\bv10\\b"
+  group[is.na(group) & grepl(wind_pat, f_low, perl=TRUE)] <- "Wind"
+  group[is.na(group) & grepl("(^|[_])iid($|_)", f_low, perl=TRUE)] <- "Cold stress"
+  group[is.na(group) & grepl("(^|[_])ihd($|_)", f_low, perl=TRUE)] <- "Thermal (heat)"
+  group[is.na(group) | group==""] <- "Thermal (heat)"
+  data.frame(feature = features, group = group, stringsAsFactors = FALSE)
+}
+
+feature_group_map <- assign_feature_group_no_others(feature_cols)
+
+all_shap_long <- list()
+perfold_perf  <- list()
+
+for (yr in years){
+  fold <- mk_fold_mats(yr)
+  tr <- fold$train; te <- fold$test
+  X_tr <- as.matrix(tr[, feature_cols]); y_tr <- tr$y
+  X_te <- as.matrix(te[, feature_cols]); y_te <- te$y
+
+  dtr <- xgb.DMatrix(data=X_tr, label=y_tr)
+  dte <- xgb.DMatrix(data=X_te, label=y_te)
+
+  params <- list(
+    objective = "reg:squarederror",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    nthread = 0,
+    min_child_weight = 1,
+    lambda = 1
+  )
+  bst <- xgb.train(params=params, data=dtr, nrounds=800, verbose=0)
+
+  pred_te <- predict(bst, dte)
+  rmse <- sqrt(mean((pred_te - y_te)^2))
+  r2   <- if (sd(y_te)>0) cor(pred_te, y_te)^2 else NA_real_
+
+  perfold_perf[[as.character(yr)]] <- tibble(grow_year=yr, RMSE=rmse, R2=r2, n=nrow(te))
+
+  if (yr %in% focus_years){
+    shap <- predict(bst, dte, predcontrib = TRUE)
+    colnames(shap) <- c(feature_cols, "BIAS")
+    shap <- shap[, feature_cols, drop=FALSE]
+    shap_long <- as.data.frame(shap) %>%
+      mutate(row_id = seq_len(n())) %>%
+      cbind(te[, c("grow_year","Province","City","County")]) %>%
+      tidyr::pivot_longer(cols = all_of(feature_cols), names_to="feature", values_to="shap_value")
+    write_csv_new(shap_long, sprintf("B_outputs/B1_SHAP_long_%d.csv", yr))
+    all_shap_long[[as.character(yr)]] <- shap_long
+  }
+}
+
+perf_all <- bind_rows(perfold_perf) %>% arrange(grow_year)
+write_csv_new(perf_all, "B_outputs/B0_LOYO_perf_xgb.csv")
+
+# ----------------------- Aggregate attribution tables -----------------------
+if (length(all_shap_long) > 0){
+  shap_all <- bind_rows(all_shap_long, .id="year_str") %>%
+    mutate(grow_year = as.integer(year_str)) %>% select(-year_str)
+
+  year_feat <- shap_all %>%
+    group_by(grow_year, feature) %>%
+    summarise(
+      mean_shap = mean(shap_value, na.rm=TRUE),
+      neg_sum   = sum(shap_value[shap_value < 0], na.rm=TRUE),
+      neg_mean  = mean(shap_value[shap_value < 0], na.rm=TRUE),
+      pos_sum   = sum(shap_value[shap_value > 0], na.rm=TRUE),
+      n         = dplyr::n(),
+      .groups="drop"
+    )
+  write_csv_new(year_feat, "B_outputs/B2_year_feature_SHAP.csv")
+
+  prov_feat <- shap_all %>%
+    group_by(grow_year, Province, feature) %>%
+    summarise(mean_shap = mean(shap_value, na.rm=TRUE),
+              neg_sum   = sum(shap_value[shap_value < 0], na.rm=TRUE),
+              n         = dplyr::n(), .groups="drop")
+  write_csv_new(prov_feat, "B_outputs/B3_year_province_feature_SHAP.csv")
+
+  county_feat <- shap_all %>%
+    group_by(grow_year, Province, City, County, feature) %>%
+    summarise(mean_shap = mean(shap_value, na.rm=TRUE),
+              neg_sum   = sum(shap_value[shap_value < 0], na.rm=TRUE),
+              n         = dplyr::n(), .groups="drop")
+  write_csv_new(county_feat, "B_outputs/B4_year_county_feature_SHAP.csv")
+}
+
+# ----------------------- Quick plots (Top-10 & Group totals) -----------------------
+plot_top10_en <- function(year_feat, yr, group_map = feature_group_map){
+  sub <- year_feat %>%
+    dplyr::filter(grow_year==yr) %>%
+    dplyr::left_join(group_map, by="feature") %>%
+    dplyr::arrange(neg_sum)
+  k <- min(10, nrow(sub)); if (k==0) return(invisible(NULL))
+  sub <- sub %>% dplyr::slice_head(n = k)
+  p <- ggplot2::ggplot(sub, ggplot2::aes(x = reorder(feature, neg_sum), y = neg_sum, fill = group)) +
+    ggplot2::geom_col(width = 0.7) + ggplot2::coord_flip() +
+    ggplot2::scale_fill_manual(values = grp_pal, drop = TRUE) +
+    ggplot2::labs(x = "Meteorological feature",
+                  y = "Sum of negative SHAP contributions (more negative = stronger decline driver)",
+                  fill = "Physical group") + nature_theme_light(11)
+  save_figure_pub(p, sprintf("B5_top10_features_%d_grouped", yr), width=7.2, height=4.6, dpi=600)
+}
+
+plot_group_summary <- function(year_feat, yr, group_map = feature_group_map){
+  sub <- year_feat %>%
+    dplyr::filter(grow_year == yr) %>%
+    dplyr::left_join(group_map, by="feature") %>%
+    dplyr::group_by(group) %>%
+    dplyr::summarise(neg_sum = sum(neg_sum, na.rm=TRUE), .groups="drop") %>%
+    dplyr::arrange(neg_sum)
+  p <- ggplot2::ggplot(sub, ggplot2::aes(x = reorder(group, neg_sum), y = neg_sum, fill = group)) +
+    ggplot2::geom_col(width = 0.7) + ggplot2::coord_flip() +
+    ggplot2::scale_fill_manual(values = grp_pal, guide = "none") +
+    ggplot2::labs(x = "Physical group", y = "Sum of negative SHAP contributions (national total)") +
+    nature_theme_light(11)
+  save_figure_pub(p, sprintf("B10_group_summary_%d", yr), width=6.4, height=4.2, dpi=600)
+}
+
+if (exists("year_feat")){
+  for (yr in focus_years){
+    plot_top10_en(year_feat, yr, group_map = feature_group_map)
+    plot_group_summary(year_feat, yr, group_map = feature_group_map)
+  }
+}
+
+# ----------------------- LOYO predictions + perf figs -----------------------
+train_predict_one_year <- function(yr){
+  fold <- mk_fold_mats(yr); tr <- fold$train; te <- fold$test
+  X_tr <- as.matrix(tr[, feature_cols]); y_tr <- tr$y
+  X_te <- as.matrix(te[, feature_cols]); y_te <- te$y
+  dtr <- xgb.DMatrix(data=X_tr, label=y_tr)
+  bst <- xgb.train(
+    params=list(objective="reg:squarederror", max_depth=4, eta=0.05, subsample=0.8,
+                colsample_bytree=0.8, nthread=0, min_child_weight=1, lambda=1),
+    data=dtr, nrounds=800, verbose=0
+  )
+  yhat <- predict(bst, xgb.DMatrix(X_te))
+  tibble(grow_year = yr, Province=te$Province, City=te$City, County=te$County,
+         y_true=y_te, y_pred=yhat, resid = y_te - yhat)
+}
+all_years  <- sort(unique(dat$grow_year))
+preds_all  <- purrr::map_df(all_years, train_predict_one_year)
+write_csv_new(preds_all, "B_outputs/B0_LOYO_predictions.csv")
+
+perf_sum <- preds_all %>%
+  group_by(grow_year) %>%
+  summarise(n=n(), RMSE = sqrt(mean((y_true - y_pred)^2)),
+            MAE = mean(abs(y_true - y_pred)),
+            Bias = mean(y_true - y_pred),
+            R2   = if (sd(y_true) > 0) cor(y_true, y_pred)^2 else NA_real_,
+            .groups = "drop") %>% arrange(grow_year)
+write_csv_new(perf_sum, "B_outputs/B0_LOYO_perf_xgb.csv")
+
+p_rmse <- ggplot(perf_sum, aes(x=grow_year, y=RMSE)) +
+  geom_line(linewidth=0.7) + geom_point(size=1.6) +
+  labs(x="Year", y="RMSE (p.p.)") + nature_theme_light(11)
+p_r2 <- ggplot(perf_sum, aes(x=grow_year, y=R2)) +
+  geom_line(linewidth=0.7) + geom_point(size=1.6) +
+  scale_y_continuous(limits=c(0,1)) +
+  labs(x="Year", y=expression(R^2)) + nature_theme_light(11)
+save_figure_pub(p_rmse, "B0_perf_RMSE_timeseries", 6.8, 3.2, 600)
+save_figure_pub(p_r2,   "B0_perf_R2_timeseries",   6.8, 3.2, 600)
+
+# ----------------------- National trend + YoY diagnostics (Fig1 variants) -----------------------
+boot_ci_mean_by_year <- function(target_df, B = 1000){
+  set.seed(1)
+  yrs <- sort(unique(target_df$grow_year))
+  out <- lapply(yrs, function(yr){
+    ids <- target_df %>% filter(grow_year == yr) %>% distinct(Province, City, County)
+    if (nrow(ids) == 0L) return(tibble(Year = yr, CI_low = NA_real_, CI_high = NA_real_))
+    stats <- replicate(B, {
+      sel <- ids[sample(seq_len(nrow(ids)), replace = TRUE), , drop = FALSE]
+      mean(target_df %>% semi_join(sel, by = c("Province","City","County")) %>%
+             filter(grow_year == yr) %>% pull(y), na.rm = TRUE)
+    })
+    tibble(Year = yr, CI_low  = quantile(stats, 0.025, na.rm = TRUE),
+           CI_high = quantile(stats, 0.975, na.rm = TRUE))
+  })
+  bind_rows(out)
+}
+
+boot_ci_yoy_by_year <- function(target_df, B = 1000){
+  set.seed(1)
+  base <- target_df %>%
+    arrange(Province, City, County, grow_year) %>%
+    group_by(Province, City, County) %>%
+    mutate(consec = grow_year - lag(grow_year) == 1, y_lag = lag(y)) %>%
+    ungroup() %>% filter(consec)
+  yrs <- sort(unique(base$grow_year))
+  out <- lapply(yrs, function(yr){
+    ids <- base %>% filter(grow_year == yr) %>% distinct(Province, City, County)
+    if (nrow(ids) == 0L) return(tibble(Year = yr, CI_low = NA_real_, CI_high = NA_real_, N_YoY = 0L))
+    stats <- replicate(B, {
+      sel <- ids[sample(seq_len(nrow(ids)), replace = TRUE), , drop = FALSE]
+      tmp <- base %>% semi_join(sel, by = c("Province","City","County")) %>% filter(grow_year == yr)
+      mean(tmp$y - tmp$y_lag, na.rm = TRUE)
+    })
+    tibble(Year = yr, CI_low  = quantile(stats, 0.025, na.rm = TRUE),
+           CI_high = quantile(stats, 0.975, na.rm = TRUE), N_YoY = nrow(ids))
+  })
+  bind_rows(out)
+}
+
+df_trend <- raw %>%
+  mutate(`Oil content` = suppressWarnings(as.numeric(.data[[target_raw_col]]))) %>%
+  group_by(grow_year) %>%
+  summarise(OilContent = mean(`Oil content`, na.rm = TRUE), .groups = "drop") %>%
+  rename(Year = grow_year) %>% arrange(Year)
+
+if (nrow(df_trend) >= 2){
+  m_lm <- lm(OilContent ~ Year, data = df_trend)
+  slope_pp_per_yr <- unname(coef(m_lm)[2])
+} else { slope_pp_per_yr <- NA_real_ }
+
+df_anom <- year_eq %>% rename(Year = grow_year, MeanAnom_pp = mu_year_eq) %>% arrange(Year)
+ci_anom <- boot_ci_mean_by_year(target, B = 1000)
+df_anom <- df_anom %>% left_join(ci_anom, by = "Year")
+
+df_yoy_base <- target %>%
+  arrange(Province, City, County, grow_year) %>%
+  group_by(Province, City, County) %>%
+  mutate(consec = grow_year - lag(grow_year) == 1, y_lag = lag(y)) %>%
+  ungroup() %>% filter(consec)
+df_yoy <- df_yoy_base %>%
+  group_by(grow_year) %>%
+  summarise(YoY_pp = mean(y - y_lag, na.rm = TRUE), N_YoY  = n(), .groups = "drop") %>%
+  rename(Year = grow_year) %>% arrange(Year)
+ci_yoy <- boot_ci_yoy_by_year(target, B = 1000) %>%
+  select(Year, CI_low, CI_high, N_YoY_boot = N_YoY)
+df_yoy <- df_yoy %>% left_join(ci_yoy, by = "Year") %>%
+  mutate(N_YoY = pmax(N_YoY, N_YoY_boot, na.rm = TRUE)) %>% select(-N_YoY_boot)
+
+p1a <- ggplot(df_trend, aes(Year, OilContent)) +
+  geom_point(size = 1.3) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7) +
+  annotate("text",
+           x = min(df_trend$Year, na.rm = TRUE) + 1,
+           y = max(df_trend$OilContent, na.rm = TRUE),
+           label = sprintf("OLS slope = %.02f p.p./yr", slope_pp_per_yr),
+           hjust = 0, vjust = 1, size = 3.2) +
+  labs(x = "Year", y = "Oil content (%)") +
+  nature_theme_light(11)
+save_figure_pub(p1a, "F1a_trend", 6.5, 3.4, 600)
+
+p1b <- ggplot(df_anom, aes(Year, MeanAnom_pp)) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high), alpha = 0.20) +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.3) +
+  labs(x = "Year", y = "National mean anomaly (p.p.)",
+       subtitle = "Shaded: county-clustered bootstrap 95% CI (B = 1,000)") +
+  nature_theme_light(11)
+save_figure_pub(p1b, "F1b_anom_CI", 6.8, 3.4, 600)
+
+p1d <- ggplot(df_yoy, aes(Year, YoY_pp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_point(size = 1.4) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.15, linewidth = 0.5) +
+  geom_text(aes(label = paste0("N=", N_YoY), y = CI_high), vjust = -0.6, size = 2.8, color = "grey30") +
+  labs(x = "Year", y = "YoY change (p.p.)",
+       subtitle = "Whiskers: county-clustered bootstrap 95% CI (B = 1,000); N = counties in both t-1 and t") +
+  nature_theme_light(11)
+save_figure_pub(p1d, "F1d_YoY_CI", 6.8, 3.6, 600)
+
+cat("\n✅ Done.\n",
+    "Tables saved to: ", normalizePath(TAB_ROOT, winslash="/", mustWork=FALSE), "\n",
+    "Figures saved to: ", normalizePath(FIG_ROOT, winslash="/", mustWork=FALSE), "\n")
